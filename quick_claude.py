@@ -1,11 +1,13 @@
-"""QuickClaude - Global hotkey launcher for Claude Code with voice + text input."""
+"""QuickClaude - Global hotkey for quick task capture (Notion) or instant Claude Code launch."""
 
 import ctypes
 import os
+import re
 import subprocess
 import sys
 import threading
 import tkinter as tk
+from pathlib import Path
 
 # DPI awareness (must be before any tkinter)
 try:
@@ -14,6 +16,8 @@ except Exception:
     pass
 
 import keyboard
+import requests
+from dotenv import load_dotenv
 
 # Voice support (optional)
 try:
@@ -22,14 +26,80 @@ try:
 except ImportError:
     VOICE_AVAILABLE = False
 
+# Load .env from script directory
+load_dotenv(Path(__file__).parent / ".env")
+
 # --- Config ---
 HOTKEY = "ctrl+shift+space"
-VOICE_LANG = "en-US"  # Change to "it-IT" for Italian
-MIC_KEYWORD = "razer"  # Auto-selects first mic matching this (case-insensitive)
+VOICE_LANG = "en-US"
+MIC_KEYWORD = "razer"
+
+NOTION_TOKEN = os.getenv("NOTION_TOKEN")
+NOTION_TASK_DB = os.getenv("NOTION_TASK_DB")
+
+# Trigger phrases that switch to "launch Claude Code" mode
+DO_IT_NOW_PATTERNS = [
+    r"^do it now\b",
+    r"^run it now\b",
+    r"^now\b",
+    r"^launch\b",
+    r"^execute\b",
+]
+
+# Known project names for Context auto-detection (lowercase → canonical)
+PROJECT_NAMES = {
+    "spelldeck": "SpellDeck", "spell deck": "SpellDeck",
+    "aitrade": "AITrade", "ai trade": "AITrade",
+    "3dterrain": "3DTerrain", "3d terrain": "3DTerrain", "terrain": "3DTerrain",
+    "mcpcourse": "MCPCourse", "mcp course": "MCPCourse",
+    "questy": "Questy",
+    "dailypilot": "DailyPilot", "daily pilot": "DailyPilot",
+    "hundredlessons": "HundredLessons", "hundred lessons": "HundredLessons",
+    "iteachlol": "ITeachLoL", "i teach lol": "ITeachLoL", "lol labs": "ITeachLoL",
+    "n1n0": "N1N0LabsWebsite", "n1n0labs": "N1N0LabsWebsite", "n1n0labswebsite": "N1N0LabsWebsite",
+    "sledescender": "sledescender", "sled": "sledescender",
+    "sellautomations": "SellAutomations", "sell automations": "SellAutomations",
+    "contentcreator": "ContentCreator", "content creator": "ContentCreator",
+    "worldfirefighters": "WorldFirefighters", "world firefighters": "WorldFirefighters", "firefighters": "WorldFirefighters",
+    "hackradar": "HackRadar", "hack radar": "HackRadar",
+    "quickclaude": "QuickClaude", "quick claude": "QuickClaude",
+    "allin": "AllIn", "all in": "AllIn",
+    "heartbeat": "Heartbeat",
+    "siegerl": "SiegeRL", "siege rl": "SiegeRL",
+    "aip": "AIP",
+    "printforge": "PrintForge", "print forge": "PrintForge",
+    "pcvalueanalyzer": "PCValueAnalyzer", "pc value": "PCValueAnalyzer",
+    "sessionmonitor": "SessionMonitor", "session monitor": "SessionMonitor",
+    "notion": "NotionBridge",
+}
+
+# Category detection keywords (lowercase keywords → Category value)
+CATEGORY_KEYWORDS = {
+    "Dev": ["bug", "fix", "broken", "crash", "error", "feature", "add", "build", "implement",
+            "refactor", "update", "upgrade", "migrate", "api", "endpoint", "database", "code",
+            "test", "deploy", "ship"],
+    "Revenue": ["monetize", "pricing", "payment", "stripe", "revenue", "marketing", "sales",
+                "landing page", "conversion", "analytics", "seo", "ads"],
+    "Research": ["research", "explore", "experiment", "prototype", "evaluate", "compare",
+                 "investigate", "try", "poc", "proof of concept"],
+    "Ops": ["deploy", "ci/cd", "infra", "server", "hosting", "monitor", "docker", "pipeline",
+            "backup", "ssl", "domain", "dns"],
+    "Admin": ["paperwork", "tax", "invoice", "bureaucracy", "legal", "insurance", "contract"],
+    "Shopping": ["buy", "order", "purchase", "amazon"],
+    "Health": ["doctor", "gym", "workout", "dentist", "medical", "health"],
+    "Home": ["clean", "repair", "furniture", "move", "apartment", "house"],
+    "Learning": ["learn", "course", "tutorial", "study", "read", "book"],
+    "School": ["school", "exam", "homework", "supsi", "patente", "assignment"],
+}
+
+# Priority keywords
+PRIORITY_KEYWORDS = {
+    8: ["urgent", "asap", "critical", "immediately", "important"],
+    3: ["low priority", "someday", "maybe", "when possible", "nice to have"],
+}
 
 
 def _find_mic_index():
-    """Find microphone device index by keyword match."""
     if not VOICE_AVAILABLE:
         return None
     try:
@@ -41,11 +111,107 @@ def _find_mic_index():
         pass
     return None
 
+
+def _classify_task(text):
+    """Classify text into Notion task fields."""
+    lower = text.lower()
+
+    # Detect Context (project)
+    context = None
+    for keyword, project in PROJECT_NAMES.items():
+        if keyword in lower:
+            context = project
+            break
+
+    # Detect Category
+    category = "Dev" if context else None
+    best_score = 0
+    for cat, keywords in CATEGORY_KEYWORDS.items():
+        score = sum(1 for kw in keywords if kw in lower)
+        if score > best_score:
+            best_score = score
+            category = cat
+
+    # If no category matched and no project context, default to general
+    if not category:
+        category = "Dev"
+
+    # Detect Priority
+    priority = 5
+    for prio, keywords in PRIORITY_KEYWORDS.items():
+        if any(kw in lower for kw in keywords):
+            priority = prio
+            break
+
+    # Detect Assignee — default Claude for dev, Nathan for personal
+    if context:
+        assignee = "Claude"
+    elif category in ("Admin", "Shopping", "Health", "Home", "School"):
+        assignee = "Nathan"
+    else:
+        assignee = "Claude"
+
+    # Effort guess
+    effort = "Quick (< 30min)"
+    if any(w in lower for w in ["build", "implement", "create", "migrate", "redesign"]):
+        effort = "Medium (< 1 day)"
+    elif any(w in lower for w in ["add", "fix", "update", "refactor"]):
+        effort = "Small (< 2h)"
+
+    return {
+        "context": context,
+        "category": category,
+        "priority": priority,
+        "assignee": assignee,
+        "effort": effort,
+    }
+
+
+def _create_notion_task(name, classification):
+    """Create a task in Notion Task List via API."""
+    if not NOTION_TOKEN or not NOTION_TASK_DB:
+        print("ERROR: NOTION_TOKEN or NOTION_TASK_DB not set in .env")
+        return False
+
+    properties = {
+        "Name": {"title": [{"text": {"content": name}}]},
+        "Status": {"select": {"name": "To Do"}},
+        "Category ": {"select": {"name": classification["category"]}},
+        "Priorit\u00e0": {"number": classification["priority"]},
+        "Assignee": {"select": {"name": classification["assignee"]}},
+        "Effort": {"select": {"name": classification["effort"]}},
+    }
+
+    if classification["context"]:
+        properties["Context"] = {"select": {"name": classification["context"]}}
+
+    resp = requests.post(
+        "https://api.notion.com/v1/pages",
+        headers={
+            "Authorization": f"Bearer {NOTION_TOKEN}",
+            "Notion-Version": "2022-06-28",
+            "Content-Type": "application/json",
+        },
+        json={"parent": {"database_id": NOTION_TASK_DB}, "properties": properties},
+        timeout=10,
+    )
+
+    if resp.status_code == 200:
+        ctx = classification["context"] or "general"
+        print(f"Task created: [{classification['category']}] {name} (P{classification['priority']}, {ctx})")
+        return True
+    else:
+        print(f"Notion API error {resp.status_code}: {resp.text[:200]}")
+        return False
+
+
 # Colors (GitHub dark theme + purple accent)
 BG = "#0d1117"
 BORDER = "#30363d"
 TEXT = "#e6edf3"
 ACCENT = "#7c3aed"
+TASK_COLOR = "#22c55e"  # Green for task mode
+LAUNCH_COLOR = "#f59e0b"  # Amber for launch mode
 MIC_ACTIVE = "#ef4444"
 MIC_INACTIVE = "#6b7280"
 HINT = "#484f58"
@@ -60,12 +226,13 @@ class QuickClaude:
         self.entry = None
         self.listening = False
         self.mic_label = None
+        self.icon_label = None
+        self.mode_label = None
         self.recognizer = sr.Recognizer() if VOICE_AVAILABLE else None
         self._trigger = threading.Event()
         self._placeholder_active = False
         self._mic_index = None
 
-        # Find preferred microphone
         if VOICE_AVAILABLE:
             result = _find_mic_index()
             if result:
@@ -74,17 +241,13 @@ class QuickClaude:
             else:
                 print(f"Warning: No mic matching '{MIC_KEYWORD}' found, using system default")
 
-        # Register global hotkey
         keyboard.add_hotkey(HOTKEY, self._on_hotkey)
-
-        # Poll for trigger from hotkey thread
         self._poll()
 
         print(f"QuickClaude ready. Press {HOTKEY} to open.")
-        print("Press Ctrl+C in this window to quit.")
+        print("Default: create Notion task. Say 'do it now' to launch Claude Code.")
         if not VOICE_AVAILABLE:
             print("(Voice disabled - install SpeechRecognition + PyAudio for mic support)")
-            print("(Tip: Press Win+H in the popup to use Windows built-in dictation)")
 
         self.root.mainloop()
 
@@ -108,44 +271,35 @@ class QuickClaude:
         self.window.attributes("-topmost", True)
         self.window.configure(bg=BORDER)
 
-        # Size and position: center horizontally, upper third vertically
-        w, h = 620, 52
+        w, h = 660, 52
         screen_w = self.window.winfo_screenwidth()
         screen_h = self.window.winfo_screenheight()
         x = (screen_w - w) // 2
         y = screen_h // 4
         self.window.geometry(f"{w}x{h}+{x}+{y}")
 
-        # Outer border frame
         outer = tk.Frame(self.window, bg=BORDER, padx=1, pady=1)
         outer.pack(fill="both", expand=True)
 
-        # Inner frame
         inner = tk.Frame(outer, bg=BG)
         inner.pack(fill="both", expand=True)
 
-        # Purple arrow icon
-        icon = tk.Label(inner, text="\u25B6", font=("Segoe UI", 11), bg=BG, fg=ACCENT)
-        icon.pack(side="left", padx=(10, 4))
+        # Mode icon (changes color based on mode)
+        self.icon_label = tk.Label(inner, text="\u25B6", font=("Segoe UI", 11), bg=BG, fg=TASK_COLOR)
+        self.icon_label.pack(side="left", padx=(10, 4))
 
         # Text entry
         self.entry = tk.Entry(
-            inner,
-            font=("Segoe UI", 13),
-            bg=BG,
-            fg=TEXT,
-            insertbackground=TEXT,
-            relief="flat",
-            border=0,
+            inner, font=("Segoe UI", 13), bg=BG, fg=TEXT,
+            insertbackground=TEXT, relief="flat", border=0,
         )
         self.entry.pack(side="left", fill="both", expand=True, padx=(2, 4), pady=8)
 
-        # Placeholder
         self._set_placeholder()
         self.entry.bind("<FocusIn>", self._clear_placeholder)
         self.entry.bind("<Key>", self._on_key)
+        self.entry.bind("<KeyRelease>", self._update_mode_indicator)
 
-        # Mic indicator (if voice available)
         if VOICE_AVAILABLE:
             self.mic_label = tk.Label(
                 inner, text="\u25CF", font=("Segoe UI", 11),
@@ -154,18 +308,15 @@ class QuickClaude:
             self.mic_label.pack(side="right", padx=(2, 4))
             self.mic_label.bind("<Button-1>", lambda e: self._toggle_listen())
 
-        # Enter hint
-        hint = tk.Label(inner, text="Enter \u21B5", font=("Segoe UI", 8), bg=BG, fg=HINT)
-        hint.pack(side="right", padx=(2, 10))
+        # Mode label (shows current mode)
+        self.mode_label = tk.Label(inner, text="task", font=("Segoe UI", 8), bg=BG, fg=TASK_COLOR)
+        self.mode_label.pack(side="right", padx=(2, 10))
 
-        # Key bindings
-        self.entry.bind("<Return>", self._launch)
+        self.entry.bind("<Return>", self._on_submit)
         self.entry.bind("<Escape>", self._close)
 
-        # Focus
         self.window.after(50, self._force_focus)
 
-        # Auto-start voice
         if VOICE_AVAILABLE:
             self._start_listening()
 
@@ -177,10 +328,32 @@ class QuickClaude:
             if self.entry:
                 self.entry.focus_force()
 
+    # --- Mode detection ---
+
+    def _is_launch_mode(self, text):
+        lower = text.strip().lower()
+        return any(re.match(p, lower) for p in DO_IT_NOW_PATTERNS)
+
+    def _strip_trigger(self, text):
+        for pattern in DO_IT_NOW_PATTERNS:
+            text = re.sub(pattern, "", text.strip(), flags=re.IGNORECASE).strip()
+        return text
+
+    def _update_mode_indicator(self, event=None):
+        if not self.entry or not self.mode_label or not self.icon_label:
+            return
+        text = self.entry.get() if not self._placeholder_active else ""
+        if self._is_launch_mode(text):
+            self.mode_label.config(text="run", fg=LAUNCH_COLOR)
+            self.icon_label.config(fg=LAUNCH_COLOR)
+        else:
+            self.mode_label.config(text="task", fg=TASK_COLOR)
+            self.icon_label.config(fg=TASK_COLOR)
+
     # --- Placeholder ---
 
     def _set_placeholder(self):
-        self.entry.insert(0, "Ask Claude anything...")
+        self.entry.insert(0, "Task... or 'do it now' to run Claude")
         self.entry.config(fg=PLACEHOLDER)
         self._placeholder_active = True
 
@@ -254,22 +427,35 @@ class QuickClaude:
             self.entry.insert(tk.END, " " + text)
         else:
             self.entry.insert(tk.END, text)
+        self._update_mode_indicator()
 
-    # --- Launch ---
+    # --- Submit ---
 
-    def _launch(self, event=None):
-        if not self.entry:
+    def _on_submit(self, event=None):
+        if not self.entry or self._placeholder_active:
             return
-        if self._placeholder_active:
-            return
-
-        prompt = self.entry.get().strip()
-        if not prompt:
+        text = self.entry.get().strip()
+        if not text:
             return
 
+        if self._is_launch_mode(text):
+            prompt = self._strip_trigger(text)
+            if prompt:
+                self._close()
+                self._launch_claude(prompt)
+            return
+
+        # Default: create Notion task
         self._close()
+        threading.Thread(target=self._create_task, args=(text,), daemon=True).start()
 
-        # Write a temp bash script that launches claude (same pattern as dispatch)
+    def _create_task(self, text):
+        classification = _classify_task(text)
+        success = _create_notion_task(text, classification)
+        if not success:
+            print(f"FALLBACK — task not saved: {text}")
+
+    def _launch_claude(self, prompt):
         import tempfile
         escaped_prompt = prompt.replace("'", "'\\''")
         script_content = f"""#!/bin/bash
@@ -281,11 +467,9 @@ claude --dangerously-skip-permissions '{escaped_prompt}'
         with open(script_path, "w", newline="\n") as f:
             f.write(script_content)
 
-        # Launch in a new window via PowerShell → Git Bash
         bash_path = r"C:\Programs\Git\bin\bash.exe"
         ps_cmd = f"""Start-Process '{bash_path}' -ArgumentList '--login','{script_path.replace(chr(92), "/")}'"""
         subprocess.Popen(["powershell", "-Command", ps_cmd])
-
         print(f"Launched: {prompt[:60]}{'...' if len(prompt) > 60 else ''}")
 
     def _close(self, event=None):
@@ -295,6 +479,8 @@ claude --dangerously-skip-permissions '{escaped_prompt}'
         self.window = None
         self.entry = None
         self.mic_label = None
+        self.icon_label = None
+        self.mode_label = None
 
 
 if __name__ == "__main__":
